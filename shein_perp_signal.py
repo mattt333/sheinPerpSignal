@@ -100,11 +100,16 @@ def fetch_hkex_closes(ticker: str = HKEX_TICKER, lookback_days: int = 90) -> pd.
     import yfinance as yf
 
     data = yf.download(ticker, period=f"{lookback_days}d", interval="1d", progress=False)
+
+    # yfinance >= 0.2.37 retourne parfois un MultiIndex de colonnes — on l'aplatit
+    if isinstance(data.columns, pd.MultiIndex):
+        data.columns = data.columns.get_level_values(0)
+
     data = data.reset_index()[["Date", "Close"]].rename(columns={"Date": "date", "Close": "close"})
     # Clôture HKEX = 16:00 HKT ce jour-là, convertie en UTC
     data["close_time_utc"] = pd.to_datetime(data["date"]).dt.tz_localize(
         f"Etc/GMT-{HKEX_TZ_OFFSET_HOURS}"
-    ).dt.tz_convert("UTC") + pd.Timedelta(hours=HKEX_CLOSE_HOUR_LOCAL - 0)  # ajuster si besoin
+    ).dt.tz_convert("UTC") + pd.Timedelta(hours=HKEX_CLOSE_HOUR_LOCAL - 0)
     return data[["close_time_utc", "close"]].rename(columns={"close": "hkex_close"})
 
 
