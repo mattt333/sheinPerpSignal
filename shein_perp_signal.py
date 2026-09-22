@@ -135,7 +135,7 @@ def build_training_set(perp_df: pd.DataFrame, hkex_df: pd.DataFrame) -> pd.DataF
 
         window = perp_df[
             (perp_df["timestamp"] > prev_close_time) & (perp_df["timestamp"] <= next_close_time)
-        ]
+            ]
         if window.empty:
             continue
 
@@ -146,7 +146,7 @@ def build_training_set(perp_df: pd.DataFrame, hkex_df: pd.DataFrame) -> pd.DataF
             tau_hours = (next_close_time - r_row["timestamp"]).total_seconds() / 3600.0
             if tau_hours <= 0:
                 continue
-            rows.append({"r": r, "tau": tau_hours, "y": y})
+            rows.append({"r": r, "tau": tau_hours, "y": y, "night_id": i})
 
     return pd.DataFrame(rows)
 
@@ -158,17 +158,30 @@ def build_training_set(perp_df: pd.DataFrame, hkex_df: pd.DataFrame) -> pd.DataF
 def calibrate(train_df: pd.DataFrame):
     """
     Ajuste P(y=1) = Phi(gamma0 + gamma1 * r / sqrt(tau)) par probit.
-    Retourne (gamma0, gamma1, résultat statsmodels complet pour diagnostics).
+
+    IMPORTANT : les observations ne sont PAS indépendantes — toutes les lignes d'une même
+    nuit/week-end partagent le même y et des r fortement corrélés (même trajectoire).
+    On clusterise donc les erreurs standard par night_id pour avoir une inférence honnête
+    (le nombre réel d'essais indépendants, c'est le nombre de nuits, pas le nombre de lignes).
     """
     x = train_df["r"] / np.sqrt(train_df["tau"])
     X = sm.add_constant(x.rename("x"))
     y = train_df["y"]
+    n_nights = train_df["night_id"].nunique()
 
     model = sm.Probit(y, X)
     result = model.fit(disp=0)
+    result_clustered = model.fit(
+        disp=0, cov_type="cluster", cov_kwds={"groups": train_df["night_id"]}
+    )
+
+    log.warning(
+        f"Calibré sur {n_nights} nuits indépendantes seulement (malgré {len(train_df)} lignes). "
+        "Se fier aux p-values/erreurs standard CLUSTERISÉES ci-dessous, pas aux non-clusterisées."
+    )
 
     gamma0, gamma1 = result.params["const"], result.params["x"]
-    return gamma0, gamma1, result
+    return gamma0, gamma1, result, result_clustered, n_nights
 
 
 # ----------------------------------------------------------------------------------------
@@ -206,14 +219,24 @@ if __name__ == "__main__":
                 "coefficients indicatifs, pas fiables statistiquement."
             )
 
-        gamma0, gamma1, result = calibrate(train)
-        log.info(f"Calibration réussie : gamma0={gamma0:.4f}, gamma1={gamma1:.4f}")
-        log.info("\n" + str(result.summary()))
+        gamma0, gamma1, result, result_clustered, n_nights = calibrate(train)
+        log.info(f"Calibration (SE non-clusterisées, à ignorer) : gamma0={gamma0:.4f}, gamma1={gamma1:.4f}")
+        log.info("\n--- Résultat CLUSTERISÉ par nuit (celui qui compte) ---\n" + str(result_clustered.summary()))
+
+        p_value_clustered = result_clustered.pvalues["x"]
+        if p_value_clustered > 0.10:
+            log.warning(
+                f"p-value clusterisée sur gamma1 = {p_value_clustered:.3f} -> l'effet du perp "
+                f"n'est PAS statistiquement distinguable de zéro avec seulement {n_nights} nuits. "
+                "Le modèle tourne mais son signal n'est pas encore validé — à ne pas trader tel quel."
+            )
 
         CALIBRATION_FILE.write_text(json.dumps({
             "gamma0": gamma0,
             "gamma1": gamma1,
             "n_observations": len(train),
+            "n_nights": int(n_nights),
+            "gamma1_pvalue_clustered": float(p_value_clustered),
             "calibrated_at": datetime.now(timezone.utc).isoformat(),
         }, indent=2))
         log.info(f"Calibration sauvegardée dans {CALIBRATION_FILE.resolve()}")
