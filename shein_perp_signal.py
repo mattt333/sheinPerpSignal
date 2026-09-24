@@ -1,251 +1,510 @@
 """
-Modèle de probabilité de hausse/baisse de SHEIN (0625.HK) à J+1 (prochaine clôture HKEX),
-basé sur le rendement du perpetual xyz:SHEIN sur Hyperliquid depuis la dernière clôture.
+bnb_ml_oracle.py
+================================================================
+Oracle ML pour le marché "BNB Up-or-Down Daily" de predict.fun.
 
-Idée : le perp trade 24/7 pendant que HKEX est fermé (nuits, week-ends). Son évolution
-pendant cette fenêtre est traitée comme un signal probabiliste avancé (exactement comme un
-future overnight sur indice), avec une pondération par le temps restant avant réouverture,
-sur le modèle d'un calcul de probabilité de franchissement (type N(d2) en pricing d'option) :
+Objectif explicite (pas de recherche d'edge / d'indicateur technique) :
+estimer P(BNB termine en hausse à 18h Paris vs la veille) à partir de
+SEULEMENT trois quantités causales, rien d'autre :
+  - l'écart de prix actuel par rapport à la référence de la veille (log_dev)
+  - le temps restant avant la clôture (tau_hours) — +0.5% à 3h de la
+    clôture n'a pas la même signification qu'à 23h
+  - la volatilité EWMA de BNB/USDT, nécessaire pour convertir (écart +
+    temps restant) en probabilité, au même titre que la vol implicite en
+    pricing d'option — ce n'est pas un signal directionnel
 
-    z = (gamma0 + gamma1 * r / sqrt(tau))
-    P(hausse) = Phi(z)
+Deux briques :
+  1. Baseline ANALYTIQUE sans paramètre libre : probabilité "digitale"
+     GBM driftless, P(up) = Phi(d) avec d = log_dev / (sigma_ewma * sqrt(tau)).
+  2. Couche ML (régression logistique + gradient boosting) entraînée sur
+     UNE SEULE feature dérivée — d_diffusion = ce même d standardisé — plus
+     tau_hours séparément, pour laisser le ML corriger la forme Φ() si la
+     fréquence empirique s'en écarte (queues plus épaisses, asymétrie...),
+     sans jamais ajouter de RSI/momentum/order-flow. Évalué par walk-forward
+     OOS contre ce baseline, pas contre un pile-ou-face à 50 %.
 
-    r   = rendement cumulé du perp depuis la dernière clôture HKEX
-    tau = temps restant avant la prochaine clôture HKEX (en heures, ou toute unité cohérente)
+Mécanique du marché (identique à bitcoin-up-or-down-on-<date>, confirmée
+par Matthieu) :
+  - Référence figée au prix BNB/USDT à midi ET (= ~18h Paris hiver / 17h
+    Paris été) le jour D-1.
+  - Résolution 24h plus tard, à midi ET le jour D : UP si prix > référence.
+  - Fenêtre de trading du bot : de 18h10 Paris (nouveau slug dispo) à
+    15h Paris le lendemain (coupure avant résolution) → on ne modélise
+    QUE cette fenêtre, jamais les 3h juste avant le fixing.
 
-gamma0, gamma1 sont calibrés par régression probit sur historique (pas fixés a priori).
+⚠️ Ce script ne peut pas être exécuté dans ce sandbox (api.binance.com
+   est bloqué en sortie ici, 403). À lancer sur ton infra qui a l'accès
+   Binance. Aucun chiffre de fiabilité ci-dessous n'est donc réel tant
+   que tu ne l'as pas fait tourner toi-même sur l'historique réel.
 
-Dépendances : pip install requests pandas numpy scipy statsmodels yfinance --break-system-packages
-
-------------------------------------------------------------------------------------------
-IMPORTANT SUR LES DONNÉES
-------------------------------------------------------------------------------------------
-Ce script suppose que tu peux atteindre :
-  - api.hyperliquid.xyz (candleSnapshot) pour l'historique du perp xyz:SHEIN
-  - Yahoo Finance (0625.HK) via yfinance pour les clôtures journalières HKEX
-
-Si l'accès à l'un des deux est différent chez toi (endpoint XYZ spécifique, autre broker
-pour 0625.HK, export CSV manuel...), remplace juste les fonctions fetch_perp_candles()
-et fetch_hkex_closes() par tes propres sources — le reste du pipeline ne change pas.
-
-Avec seulement ~3 semaines d'historique coté (IPO le 1er sept. 2026), la calibration sera
-bruitée. Le script te donne quand même les diagnostics nécessaires pour juger si le modèle
-est exploitable ou s'il faut attendre plus de données / élargir la fenêtre d'estimation de tau.
-------------------------------------------------------------------------------------------
+Dépendances : pandas, numpy, scikit-learn, requests, scipy, joblib
+    pip install pandas numpy scikit-learn requests scipy joblib
 """
 
-import json
-import logging
+from __future__ import annotations
+
+import time
+import math
+import joblib
+import requests
 import numpy as np
 import pandas as pd
-import requests
+from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from scipy.stats import norm
-import statsmodels.api as sm
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import brier_score_loss, log_loss, accuracy_score
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler("shein_perp_signal.log"),
-        logging.StreamHandler(),
-    ],
-)
-log = logging.getLogger("shein_perp_signal")
+# ============================================================
+# CONFIG
+# ============================================================
+SYMBOL = "BNBUSDT"
+KLINES_INTERVAL = "1h"          # bougies horaires : assez fin pour capter
+# la structure intra-cycle, assez léger
+# pour couvrir plusieurs années
+BINANCE_BASE = "https://api.binance.com"
+ET_TZ = ZoneInfo("America/New_York")
+PARIS_TZ = ZoneInfo("Europe/Paris")
 
-CALIBRATION_FILE = Path("calibration.json")
+BID_ASK_MARGIN = 0.01           # même convention que le bot (spread autour
+# de la proba fair)
 
-HYPERLIQUID_API = "https://api.hyperliquid.xyz/info"
-HKEX_TICKER = "0625.HK"
-PERP_COIN = "xyz:SHEIN"  # nom exact du marché tel qu'exposé par l'API Hyperliquid (à vérifier)
+# Fenêtre de trading (doit matcher CRYPTO_DAILY_CUTOFF/RESTART du bot)
+CUTOFF_HOUR_PARIS = 15
+RESTART_HOUR_PARIS = 18
+RESTART_MINUTE_PARIS = 10
 
-# HKEX : 9:30-12:00 puis 13:00-16:00 heure de Hong Kong (UTC+8), fermé sam/dim.
-HKEX_TZ_OFFSET_HOURS = 8
-HKEX_CLOSE_HOUR_LOCAL = 16  # 16:00 HKT
+# Pas d'échantillonnage des features à l'intérieur d'un cycle (backtest)
+FEATURE_SAMPLE_STEP_HOURS = 1
 
-
-# ----------------------------------------------------------------------------------------
-# 1. RÉCUPÉRATION DES DONNÉES
-# ----------------------------------------------------------------------------------------
-
-def fetch_perp_candles(coin: str = PERP_COIN, interval: str = "15m", lookback_days: int = 60) -> pd.DataFrame:
-    """Historique des bougies du perp via l'API publique Hyperliquid (candleSnapshot)."""
-    end_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    start_ms = end_ms - lookback_days * 24 * 60 * 60 * 1000
-
-    payload = {
-        "type": "candleSnapshot",
-        "req": {
-            "coin": coin,
-            "interval": interval,
-            "startTime": start_ms,
-            "endTime": end_ms,
-        },
-    }
-    resp = requests.post(HYPERLIQUID_API, json=payload, timeout=30)
-    resp.raise_for_status()
-    raw = resp.json()
-
-    df = pd.DataFrame(raw)
-    # Colonnes typiques de l'API Hyperliquid : t (open time ms), T (close time ms), o,h,l,c,v
-    df["t"] = pd.to_datetime(df["t"], unit="ms", utc=True)
-    df = df.rename(columns={"t": "timestamp", "c": "close"})
-    df["close"] = df["close"].astype(float)
-    return df[["timestamp", "close"]].sort_values("timestamp").reset_index(drop=True)
+RANDOM_STATE = 42
 
 
-def fetch_hkex_closes(ticker: str = HKEX_TICKER, lookback_days: int = 90) -> pd.DataFrame:
-    """Clôtures journalières de 0625.HK via yfinance."""
-    import yfinance as yf
+# ============================================================
+# 1. RÉCUPÉRATION DES DONNÉES BINANCE (klines publiques)
+# ============================================================
 
-    data = yf.download(ticker, period=f"{lookback_days}d", interval="1d", progress=False)
-
-    # yfinance >= 0.2.37 retourne parfois un MultiIndex de colonnes — on l'aplatit
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-
-    data = data.reset_index()[["Date", "Close"]].rename(columns={"Date": "date", "Close": "close"})
-    # Clôture HKEX = 16:00 HKT ce jour-là, convertie en UTC
-    data["close_time_utc"] = pd.to_datetime(data["date"]).dt.tz_localize(
-        f"Etc/GMT-{HKEX_TZ_OFFSET_HOURS}"
-    ).dt.tz_convert("UTC") + pd.Timedelta(hours=HKEX_CLOSE_HOUR_LOCAL - 0)
-    return data[["close_time_utc", "close"]].rename(columns={"close": "hkex_close"})
-
-
-# ----------------------------------------------------------------------------------------
-# 2. CONSTRUCTION DU DATASET (r, tau, y) POUR CHAQUE OBSERVATION
-# ----------------------------------------------------------------------------------------
-
-def build_training_set(perp_df: pd.DataFrame, hkex_df: pd.DataFrame) -> pd.DataFrame:
+def fetch_binance_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> pd.DataFrame:
     """
-    Pour chaque bougie perp comprise entre deux clôtures HKEX consécutives :
-      - r   = rendement perp depuis la clôture HKEX précédente
-      - tau = heures restantes avant la clôture HKEX suivante
-      - y   = 1 si la clôture suivante est en hausse vs la précédente, sinon 0
+    Pagine sur /api/v3/klines (max 1000 bougies/requête).
+    Retourne un DataFrame indexé par timestamp UTC avec OHLCV +
+    taker_buy_base (proxy de pression acheteuse).
     """
     rows = []
-    hkex_df = hkex_df.sort_values("close_time_utc").reset_index(drop=True)
+    cursor = start_ms
+    session = requests.Session()
 
-    for i in range(len(hkex_df) - 1):
-        prev_close_time = hkex_df.loc[i, "close_time_utc"]
-        prev_close_price = hkex_df.loc[i, "hkex_close"]
-        next_close_time = hkex_df.loc[i + 1, "close_time_utc"]
-        next_close_price = hkex_df.loc[i + 1, "hkex_close"]
+    while cursor < end_ms:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "startTime": cursor,
+            "endTime": end_ms,
+            "limit": 1000,
+        }
+        resp = session.get(f"{BINANCE_BASE}/api/v3/klines", params=params, timeout=10)
+        resp.raise_for_status()
+        batch = resp.json()
+        if not batch:
+            break
+        rows.extend(batch)
+        last_open_time = batch[-1][0]
+        cursor = last_open_time + 1
+        if len(batch) < 1000:
+            break
+        time.sleep(0.25)  # rate limit courtoisie
 
-        window = perp_df[
-            (perp_df["timestamp"] > prev_close_time) & (perp_df["timestamp"] <= next_close_time)
-            ]
-        if window.empty:
+    cols = [
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "n_trades",
+        "taker_buy_base", "taker_buy_quote", "ignore",
+    ]
+    df = pd.DataFrame(rows, columns=cols)
+    for c in ["open", "high", "low", "close", "volume", "taker_buy_base", "taker_buy_quote"]:
+        df[c] = df[c].astype(float)
+    df["timestamp"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df = df.set_index("timestamp").sort_index()
+    return df[["open", "high", "low", "close", "volume", "taker_buy_base", "n_trades"]]
+
+
+def load_full_history(symbol: str = SYMBOL, interval: str = KLINES_INTERVAL,
+                      years_back: int = 4) -> pd.DataFrame:
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=365 * years_back)
+    print(f"📥 Téléchargement {symbol} {interval} de {start.date()} à {end.date()}...")
+    df = fetch_binance_klines(symbol, interval, int(start.timestamp() * 1000), int(end.timestamp() * 1000))
+    print(f"✅ {len(df)} bougies récupérées.")
+    return df
+
+
+# ============================================================
+# 2. CONSTRUCTION DES CYCLES (référence J-1 midi ET → résolution J midi ET)
+# ============================================================
+
+def _next_noon_et(ts: pd.Timestamp) -> pd.Timestamp:
+    """Prochain midi ET strictement après ts (gère le passage DST via ZoneInfo)."""
+    local = ts.tz_convert(ET_TZ)
+    noon = local.replace(hour=12, minute=0, second=0, microsecond=0)
+    if local >= noon:
+        noon = noon + timedelta(days=1)
+    return noon.tz_convert("UTC")
+
+
+def price_at(df: pd.DataFrame, ts: pd.Timestamp) -> float | None:
+    """Prix (close) de la bougie la plus proche <= ts (pas de look-ahead)."""
+    sub = df.loc[:ts]
+    if sub.empty:
+        return None
+    return float(sub["close"].iloc[-1])
+
+
+@dataclass
+class Cycle:
+    cycle_id: int
+    ref_time: pd.Timestamp
+    ref_price: float
+    res_time: pd.Timestamp
+    res_price: float
+    label: int  # 1 = up, 0 = down/flat
+
+
+def build_cycles(df: pd.DataFrame) -> list[Cycle]:
+    """Un cycle = un slug journalier bnb-up-or-down-on-<date>."""
+    cycles = []
+    t = df.index[0]
+    ref_time = _next_noon_et(t)
+    cid = 0
+    while True:
+        res_time = ref_time + timedelta(hours=24)
+        if res_time > df.index[-1]:
+            break
+        ref_price = price_at(df, ref_time)
+        res_price = price_at(df, res_time)
+        if ref_price is None or res_price is None:
+            ref_time = res_time
+            continue
+        cycles.append(Cycle(
+            cycle_id=cid, ref_time=ref_time, ref_price=ref_price,
+            res_time=res_time, res_price=res_price,
+            label=int(res_price > ref_price),
+        ))
+        cid += 1
+        ref_time = res_time
+    print(f"📊 {len(cycles)} cycles journaliers construits "
+          f"(base-rate up = {np.mean([c.label for c in cycles]):.3f})")
+    return cycles
+
+
+# ============================================================
+# 3. FEATURES POINT-IN-TIME (calculées avec seulement des données <= t)
+# ============================================================
+
+def _log_ret(series: pd.Series, periods: int) -> pd.Series:
+    return np.log(series / series.shift(periods))
+
+
+def enrich_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Volontairement minimal : seule la volatilité EWMA est calculée (elle
+    sert à convertir écart de prix + temps restant en probabilité — pas
+    un indicateur directionnel). Aucun RSI/momentum/order-flow.
+    """
+    df = df.copy()
+    df["ret_1h"] = _log_ret(df["close"], 1)
+    df["sigma_ewma"] = df["ret_1h"].ewm(halflife=6).std() * math.sqrt(24)  # annualisée "par cycle" 24h
+    return df
+
+
+def in_trading_window(ts_utc: pd.Timestamp) -> bool:
+    """Reproduit is_crypto_daily_trading_allowed() du bot (fuseau Paris)."""
+    local = ts_utc.tz_convert(PARIS_TZ)
+    h, m = local.hour, local.minute
+    if h < CUTOFF_HOUR_PARIS:
+        return True
+    if h > RESTART_HOUR_PARIS:
+        return True
+    if h == RESTART_HOUR_PARIS and m >= RESTART_MINUTE_PARIS:
+        return True
+    return False
+
+
+FEATURE_COLS = [
+    "d_diffusion",  # log_dev / (sigma_ewma * sqrt(tau/24)) — écart standardisé
+    "tau_hours",    # temps restant, gardé séparément pour laisser le ML
+    # corriger la loi d'échelle sqrt(tau) si elle ne tient
+    # pas exactement dans les données réelles
+]
+
+
+def build_feature_rows(df_ind: pd.DataFrame, cycles: list[Cycle]) -> pd.DataFrame:
+    """
+    Pour chaque cycle, échantillonne un point de features toutes les
+    FEATURE_SAMPLE_STEP_HOURS à l'intérieur de la fenêtre de trading
+    réellement utilisée par le bot (jamais dans les 3h avant fixing).
+    Chaque ligne garde cycle_id pour un split walk-forward sans fuite
+    (toutes les lignes d'un même cycle restent groupées).
+    """
+    rows = []
+    for c in cycles:
+        t = c.ref_time
+        while t < c.res_time:
+            if t in df_ind.index or True:  # tolérance : on cherche <= t
+                if in_trading_window(t):
+                    snap = df_ind.loc[:t]
+                    if len(snap) < 30:
+                        t += timedelta(hours=FEATURE_SAMPLE_STEP_HOURS)
+                        continue
+                    last = snap.iloc[-1]
+                    S_t = last["close"]
+                    tau_h = (c.res_time - t).total_seconds() / 3600.0
+                    if tau_h <= 0:
+                        t += timedelta(hours=FEATURE_SAMPLE_STEP_HOURS)
+                        continue
+                    sigma_ewma = last["sigma_ewma"]
+                    log_dev = math.log(S_t / c.ref_price)
+                    sigma_tau = sigma_ewma * math.sqrt(tau_h / 24.0) if sigma_ewma and sigma_ewma > 0 else None
+                    if not sigma_tau or sigma_tau <= 0:
+                        t += timedelta(hours=FEATURE_SAMPLE_STEP_HOURS)
+                        continue
+                    rows.append({
+                        "cycle_id": c.cycle_id,
+                        "t": t,
+                        "log_dev": log_dev,               # gardé pour diagnostic/baseline, pas dans FEATURE_COLS
+                        "tau_hours": tau_h,
+                        "sigma_ewma": sigma_ewma,          # gardé pour diagnostic/baseline
+                        "d_diffusion": log_dev / sigma_tau,
+                        "sigma_for_gbm": sigma_ewma,
+                        "label": c.label,
+                    })
+            t += timedelta(hours=FEATURE_SAMPLE_STEP_HOURS)
+
+    feat = pd.DataFrame(rows).dropna(subset=FEATURE_COLS + ["label"])
+    print(f"🧮 {len(feat)} lignes de features sur {feat['cycle_id'].nunique()} cycles.")
+    return feat
+
+
+# ============================================================
+# 4. BASELINE ANALYTIQUE — digitale GBM driftless
+# ============================================================
+
+def analytic_prob_up(S_t: float, K: float, tau_hours: float, sigma_annualized_proxy: float) -> float:
+    """
+    P(S_T > K) sous GBM sans dérive (marché efficient) :
+        d = log(S_t/K) / (sigma * sqrt(tau))
+        P(up) = Phi(d)
+    sigma_annualized_proxy = écart-type horaire * sqrt(24) déjà annualisé
+    "par cycle" (cf. sigma_ewma ci-dessus) ; on le remet à l'échelle de tau.
+    """
+    if sigma_annualized_proxy <= 0 or tau_hours <= 0:
+        return 0.5
+    sigma_tau = sigma_annualized_proxy * math.sqrt(tau_hours / 24.0)
+    if sigma_tau <= 0:
+        return 0.5
+    d = math.log(S_t / K) / sigma_tau
+    return float(norm.cdf(d))
+
+
+# ============================================================
+# 5. WALK-FORWARD BACKTEST (groupé par cycle_id, jamais par ligne)
+# ============================================================
+
+def walk_forward_splits(cycle_ids: np.ndarray, n_folds: int = 8, min_train_frac: float = 0.3):
+    """Découpe les cycles (triés chronologiquement) en folds expanding-window."""
+    uniq = np.sort(np.unique(cycle_ids))
+    n = len(uniq)
+    start = int(n * min_train_frac)
+    fold_edges = np.linspace(start, n, n_folds + 1).astype(int)
+    for i in range(n_folds):
+        train_cycles = uniq[:fold_edges[i]]
+        test_cycles = uniq[fold_edges[i]:fold_edges[i + 1]]
+        if len(test_cycles) == 0:
+            continue
+        yield train_cycles, test_cycles
+
+
+def run_backtest(feat: pd.DataFrame, n_folds: int = 8) -> pd.DataFrame:
+    results = []
+
+    for train_cycles, test_cycles in walk_forward_splits(feat["cycle_id"].values, n_folds):
+        train = feat[feat["cycle_id"].isin(train_cycles)]
+        test = feat[feat["cycle_id"].isin(test_cycles)]
+        if train.empty or test.empty:
             continue
 
-        y = 1 if next_close_price > prev_close_price else 0
+        X_train, y_train = train[FEATURE_COLS].values, train["label"].values
+        X_test, y_test = test[FEATURE_COLS].values, test["label"].values
 
-        for _, r_row in window.iterrows():
-            r = r_row["close"] / prev_close_price - 1.0
-            tau_hours = (next_close_time - r_row["timestamp"]).total_seconds() / 3600.0
-            if tau_hours <= 0:
-                continue
-            rows.append({"r": r, "tau": tau_hours, "y": y, "night_id": i})
+        scaler = StandardScaler().fit(X_train)
+        Xtr, Xte = scaler.transform(X_train), scaler.transform(X_test)
 
-    return pd.DataFrame(rows)
+        # -- Baselines --
+        p_naive = np.full(len(test), 0.5)
+        p_prior = np.full(len(test), train["label"].mean())
+        p_gbm = test.apply(
+            lambda r: analytic_prob_up(
+                math.exp(r["log_dev"]),  # = S_t / K, on n'a pas besoin de K/S_t séparément
+                1.0,                      # K normalisé à 1 puisque log_dev = log(S_t/K)
+                r["tau_hours"], r["sigma_for_gbm"]
+            ), axis=1
+        ).values
+
+        # -- ML --
+        logit = LogisticRegression(max_iter=1000, C=0.5, random_state=RANDOM_STATE)
+        logit.fit(Xtr, y_train)
+        p_logit = logit.predict_proba(Xte)[:, 1]
+
+        gbc = GradientBoostingClassifier(
+            n_estimators=150, max_depth=2, learning_rate=0.03,
+            subsample=0.8, random_state=RANDOM_STATE,
+        )
+        gbc.fit(Xtr, y_train)
+        p_gbc = gbc.predict_proba(Xte)[:, 1]
+
+        for name, p in [("naive_50", p_naive), ("prior_hist", p_prior),
+                        ("gbm_analytique", p_gbm), ("logit_ml", p_logit),
+                        ("gbc_ml", p_gbc)]:
+            p_clip = np.clip(p, 1e-4, 1 - 1e-4)
+            results.append({
+                "fold_test_cycles": len(test_cycles),
+                "model": name,
+                "brier": brier_score_loss(y_test, p_clip),
+                "logloss": log_loss(y_test, p_clip),
+                "accuracy": accuracy_score(y_test, (p_clip >= 0.5).astype(int)),
+                "n": len(y_test),
+            })
+
+    res = pd.DataFrame(results)
+    summary = res.groupby("model").apply(
+        lambda g: pd.Series({
+            "brier_mean": np.average(g["brier"], weights=g["n"]),
+            "logloss_mean": np.average(g["logloss"], weights=g["n"]),
+            "accuracy_mean": np.average(g["accuracy"], weights=g["n"]),
+            "n_total": g["n"].sum(),
+        })
+    ).sort_values("brier_mean")
+    return summary
 
 
-# ----------------------------------------------------------------------------------------
-# 3. CALIBRATION (régression probit)
-# ----------------------------------------------------------------------------------------
-
-def calibrate(train_df: pd.DataFrame):
+def diebold_mariano_like(feat: pd.DataFrame, p_a: np.ndarray, p_b: np.ndarray, y: np.ndarray) -> dict:
     """
-    Ajuste P(y=1) = Phi(gamma0 + gamma1 * r / sqrt(tau)) par probit.
-
-    IMPORTANT : les observations ne sont PAS indépendantes — toutes les lignes d'une même
-    nuit/week-end partagent le même y et des r fortement corrélés (même trajectoire).
-    On clusterise donc les erreurs standard par night_id pour avoir une inférence honnête
-    (le nombre réel d'essais indépendants, c'est le nombre de nuits, pas le nombre de lignes).
+    Test apparié simple sur la différence de perte quadratique (Brier)
+    entre deux modèles, pour juger si un écart de Brier score est
+    statistiquement significatif ou juste du bruit d'échantillonnage.
+    Pas un vrai DM-test HAC (les cycles se chevauchent peu ici vu le
+    sous-échantillonnage horaire), mais donne un ordre de grandeur.
     """
-    x = train_df["r"] / np.sqrt(train_df["tau"])
-    X = sm.add_constant(x.rename("x"))
-    y = train_df["y"]
-    n_nights = train_df["night_id"].nunique()
+    d = (p_a - y) ** 2 - (p_b - y) ** 2
+    mean_d = d.mean()
+    se_d = d.std(ddof=1) / math.sqrt(len(d))
+    t_stat = mean_d / se_d if se_d > 0 else np.nan
+    return {"mean_diff": mean_d, "t_stat": t_stat, "n": len(d)}
 
-    model = sm.Probit(y, X)
-    result = model.fit(disp=0)
-    result_clustered = model.fit(
-        disp=0, cov_type="cluster", cov_kwds={"groups": train_df["night_id"]}
+
+# ============================================================
+# 6. MODÈLE FINAL (entraîné sur tout l'historique) + INFÉRENCE LIVE
+# ============================================================
+
+def train_final_model(feat: pd.DataFrame, out_path: str = "bnb_oracle_model.joblib"):
+    X = feat[FEATURE_COLS].values
+    y = feat["label"].values
+    scaler = StandardScaler().fit(X)
+    model = LogisticRegression(max_iter=1000, C=0.5, random_state=RANDOM_STATE)
+    model.fit(scaler.transform(X), y)
+    joblib.dump({"model": model, "scaler": scaler, "features": FEATURE_COLS}, out_path)
+    print(f"💾 Modèle sauvegardé → {out_path}")
+    return model, scaler
+
+
+def predict_up_probability(model, scaler, S_t: float, K: float, tau_hours: float,
+                           sigma_ewma: float, blend_with_gbm: float = 0.5) -> float:
+    """
+    Inférence live. Entrées : prix courant, référence de la veille, temps
+    restant, volatilité EWMA — rien d'autre.
+    blend_with_gbm ∈ [0,1] : pondère la sortie ML avec le baseline
+    analytique (recommandé tant que le ML n'a pas prouvé un edge net et
+    stable en walk-forward — voir run_backtest()).
+    """
+    log_dev = math.log(S_t / K)
+    sigma_tau = sigma_ewma * math.sqrt(tau_hours / 24.0) if sigma_ewma and sigma_ewma > 0 else None
+    if not sigma_tau or sigma_tau <= 0:
+        return 0.5
+    d = log_dev / sigma_tau
+    x = np.array([[d, tau_hours]])
+    p_ml = float(model.predict_proba(scaler.transform(x))[:, 1][0])
+    p_gbm = analytic_prob_up(S_t, K, tau_hours, sigma_ewma)
+    return blend_with_gbm * p_gbm + (1 - blend_with_gbm) * p_ml
+
+
+# ============================================================
+# 7. ADAPTATEUR ORACLE — même format de sortie que get_polymarket_par_slug()
+#    (à appeler depuis le bot pour le slug BNB daily uniquement)
+# ============================================================
+
+def get_bnb_ml_oracle(slug: str, ref_price: float, ref_time: pd.Timestamp,
+                      model, scaler, current_kline_1h_tail: pd.DataFrame,
+                      question_up: str, question_down: str) -> list[dict]:
+    """
+    Reproduit exactement le format renvoyé par get_polymarket_par_slug()
+    (liste de dicts avec question/best_bid/best_ask), pour brancher sans
+    toucher à should_remove_orders()/get_buy_signal() côté bot : il suffit
+    de router process_market(marche_bnb_daily, ...) sur cette fonction au
+    lieu de get_polymarket_par_slug().
+
+    current_kline_1h_tail : DataFrame des dernières ~48h de bougies 1h,
+    déjà enrichi via enrich_indicators(), avec le prix courant en dernière ligne.
+    """
+    now = current_kline_1h_tail.index[-1]
+    last = current_kline_1h_tail.iloc[-1]
+    S_t = last["close"]
+    tau_hours = (ref_time + timedelta(hours=24) - now).total_seconds() / 3600.0
+
+    p_up = predict_up_probability(
+        model, scaler, S_t, ref_price, tau_hours, last["sigma_ewma"],
     )
+    p_down = 1.0 - p_up
 
-    log.warning(
-        f"Calibré sur {n_nights} nuits indépendantes seulement (malgré {len(train_df)} lignes). "
-        "Se fier aux p-values/erreurs standard CLUSTERISÉES ci-dessous, pas aux non-clusterisées."
-    )
-
-    gamma0, gamma1 = result.params["const"], result.params["x"]
-    return gamma0, gamma1, result, result_clustered, n_nights
-
-
-# ----------------------------------------------------------------------------------------
-# 4. PRÉDICTION EN TEMPS RÉEL
-# ----------------------------------------------------------------------------------------
-
-def predict_probability(r_now: float, tau_now_hours: float, gamma0: float, gamma1: float) -> float:
-    """r_now : rendement perp depuis la dernière clôture HKEX (ex: 0.001 pour +0.1%)
-       tau_now_hours : heures restantes avant la prochaine clôture HKEX"""
-    z = gamma0 + gamma1 * r_now / np.sqrt(tau_now_hours)
-    return float(norm.cdf(z))
+    return [
+        {"question": question_up, "token_id": None,
+         "best_bid": max(0.0, p_up - BID_ASK_MARGIN),
+         "best_ask": min(1.0, p_up + BID_ASK_MARGIN),
+         "spread": None, "group_item_title": None, "market_slug": slug},
+        {"question": question_down, "token_id": None,
+         "best_bid": max(0.0, p_down - BID_ASK_MARGIN),
+         "best_ask": min(1.0, p_down + BID_ASK_MARGIN),
+         "spread": None, "group_item_title": None, "market_slug": slug},
+    ]
 
 
-# ----------------------------------------------------------------------------------------
-# 5. EXEMPLE D'UTILISATION
-# ----------------------------------------------------------------------------------------
+# ============================================================
+# MAIN — à lancer sur ton infra (accès Binance requis)
+# ============================================================
+
+def main():
+    df = load_full_history(years_back=4)
+    df_ind = enrich_indicators(df)
+    cycles = build_cycles(df_ind)
+    feat = build_feature_rows(df_ind, cycles)
+
+    print("\n=== Backtest walk-forward (expanding window, 8 folds) ===")
+    summary = run_backtest(feat, n_folds=8)
+    print(summary.to_string())
+
+    print("\n💡 Lecture :")
+    print(" - brier_mean / logloss_mean : plus bas = mieux.")
+    print(" - Compare gbc_ml / logit_ml au gbm_analytique, PAS au naive_50.")
+    print(" - Si gbm_analytique bat déjà largement naive_50 et prior_hist,")
+    print("   c'est normal (le marché a une dérive/vol structurelle) — la")
+    print("   vraie question est : le ML apporte-t-il un edge AU-DESSUS du GBM ?")
+    print(" - Si l'écart logit_ml/gbc_ml vs gbm_analytique est < ~0.002 en Brier,")
+    print("   ce n'est probablement que du bruit → ne pas déployer le ML seul,")
+    print("   utiliser gbm_analytique (ou un blend à faible poids ML).")
+
+    # Entraînement final sur tout l'historique pour la mise en prod
+    model, scaler = train_final_model(feat)
+
 
 if __name__ == "__main__":
-    log.info("Démarrage de la calibration")
-    try:
-        log.info("Récupération des bougies perp Hyperliquid (60j)...")
-        perp = fetch_perp_candles(lookback_days=60)
-        log.info(f"{len(perp)} bougies perp récupérées")
-
-        log.info("Récupération des clôtures HKEX (90j)...")
-        hkex = fetch_hkex_closes(lookback_days=90)
-        log.info(f"{len(hkex)} clôtures HKEX récupérées")
-
-        train = build_training_set(perp, hkex)
-        log.info(f"{len(train)} observations (r, tau, y) construites")
-
-        if len(train) < 200:
-            log.warning(
-                "Peu d'observations (historique coté encore court) — "
-                "coefficients indicatifs, pas fiables statistiquement."
-            )
-
-        gamma0, gamma1, result, result_clustered, n_nights = calibrate(train)
-        log.info(f"Calibration (SE non-clusterisées, à ignorer) : gamma0={gamma0:.4f}, gamma1={gamma1:.4f}")
-        log.info("\n--- Résultat CLUSTERISÉ par nuit (celui qui compte) ---\n" + str(result_clustered.summary()))
-
-        p_value_clustered = result_clustered.pvalues["x"]
-        if p_value_clustered > 0.10:
-            log.warning(
-                f"p-value clusterisée sur gamma1 = {p_value_clustered:.3f} -> l'effet du perp "
-                f"n'est PAS statistiquement distinguable de zéro avec seulement {n_nights} nuits. "
-                "Le modèle tourne mais son signal n'est pas encore validé — à ne pas trader tel quel."
-            )
-
-        CALIBRATION_FILE.write_text(json.dumps({
-            "gamma0": gamma0,
-            "gamma1": gamma1,
-            "n_observations": len(train),
-            "n_nights": int(n_nights),
-            "gamma1_pvalue_clustered": float(p_value_clustered),
-            "calibrated_at": datetime.now(timezone.utc).isoformat(),
-        }, indent=2))
-        log.info(f"Calibration sauvegardée dans {CALIBRATION_FILE.resolve()}")
-
-        # Exemples repris de la question : +0.1% de rendement perp, à 20h puis à 1h de la clôture
-        for r_now, tau in [(0.001, 20), (0.001, 1)]:
-            p = predict_probability(r_now, tau, gamma0, gamma1)
-            log.info(f"Exemple : r={r_now:+.2%}, tau={tau}h  ->  P(hausse) = {p:.1%}")
-
-    except Exception:
-        log.exception("Échec de la calibration")
-        raise
+    main()
