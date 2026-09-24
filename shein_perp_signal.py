@@ -325,82 +325,133 @@ def walk_forward_splits(cycle_ids: np.ndarray, n_folds: int = 8, min_train_frac:
         yield train_cycles, test_cycles
 
 
-def run_backtest(feat: pd.DataFrame, n_folds: int = 8) -> pd.DataFrame:
-    results = []
+def collect_oos_predictions(feat: pd.DataFrame, n_folds: int = 8) -> pd.DataFrame:
+    """
+    Même boucle walk-forward que précédemment, mais retourne les
+    prédictions LIGNE PAR LIGNE (pas juste des moyennes agrégées), pour
+    permettre ensuite : ventilation par horizon, calibration, test de
+    significativité clusterisé par cycle.
+    """
+    frames = []
 
     for train_cycles, test_cycles in walk_forward_splits(feat["cycle_id"].values, n_folds):
         train = feat[feat["cycle_id"].isin(train_cycles)]
-        test = feat[feat["cycle_id"].isin(test_cycles)]
+        test = feat[feat["cycle_id"].isin(test_cycles)].copy()
         if train.empty or test.empty:
             continue
 
         X_train, y_train = train[FEATURE_COLS].values, train["label"].values
-        X_test, y_test = test[FEATURE_COLS].values, test["label"].values
+        X_test = test[FEATURE_COLS].values
 
         scaler = StandardScaler().fit(X_train)
         Xtr, Xte = scaler.transform(X_train), scaler.transform(X_test)
 
-        # -- Baselines --
-        p_naive = np.full(len(test), 0.5)
-        p_prior = np.full(len(test), train["label"].mean())
-        p_gbm = test.apply(
-            lambda r: analytic_prob_up(
-                math.exp(r["log_dev"]),  # = S_t / K, on n'a pas besoin de K/S_t séparément
-                1.0,                      # K normalisé à 1 puisque log_dev = log(S_t/K)
-                r["tau_hours"], r["sigma_for_gbm"]
-            ), axis=1
-        ).values
+        test["p_naive_50"] = 0.5
+        test["p_prior_hist"] = train["label"].mean()
+        test["p_gbm_analytique"] = test.apply(
+            lambda r: analytic_prob_up(math.exp(r["log_dev"]), 1.0, r["tau_hours"], r["sigma_for_gbm"]),
+            axis=1,
+        )
 
-        # -- ML --
         logit = LogisticRegression(max_iter=1000, C=0.5, random_state=RANDOM_STATE)
         logit.fit(Xtr, y_train)
-        p_logit = logit.predict_proba(Xte)[:, 1]
+        test["p_logit_ml"] = logit.predict_proba(Xte)[:, 1]
 
         gbc = GradientBoostingClassifier(
             n_estimators=150, max_depth=2, learning_rate=0.03,
             subsample=0.8, random_state=RANDOM_STATE,
         )
         gbc.fit(Xtr, y_train)
-        p_gbc = gbc.predict_proba(Xte)[:, 1]
+        test["p_gbc_ml"] = gbc.predict_proba(Xte)[:, 1]
 
-        for name, p in [("naive_50", p_naive), ("prior_hist", p_prior),
-                        ("gbm_analytique", p_gbm), ("logit_ml", p_logit),
-                        ("gbc_ml", p_gbc)]:
-            p_clip = np.clip(p, 1e-4, 1 - 1e-4)
-            results.append({
-                "fold_test_cycles": len(test_cycles),
-                "model": name,
-                "brier": brier_score_loss(y_test, p_clip),
-                "logloss": log_loss(y_test, p_clip),
-                "accuracy": accuracy_score(y_test, (p_clip >= 0.5).astype(int)),
-                "n": len(y_test),
-            })
+        frames.append(test)
 
-    res = pd.DataFrame(results)
-    summary = res.groupby("model").apply(
-        lambda g: pd.Series({
-            "brier_mean": np.average(g["brier"], weights=g["n"]),
-            "logloss_mean": np.average(g["logloss"], weights=g["n"]),
-            "accuracy_mean": np.average(g["accuracy"], weights=g["n"]),
-            "n_total": g["n"].sum(),
+    return pd.concat(frames, ignore_index=True)
+
+
+PRED_COLS = ["p_naive_50", "p_prior_hist", "p_gbm_analytique", "p_logit_ml", "p_gbc_ml"]
+
+
+def summarize_predictions(oos: pd.DataFrame) -> pd.DataFrame:
+    """Reproduit le tableau agrégé d'origine (Brier/logloss/accuracy par modèle)."""
+    rows = []
+    y = oos["label"].values
+    for col in PRED_COLS:
+        p = np.clip(oos[col].values, 1e-4, 1 - 1e-4)
+        rows.append({
+            "model": col.replace("p_", ""),
+            "brier_mean": brier_score_loss(y, p),
+            "logloss_mean": log_loss(y, p),
+            "accuracy_mean": accuracy_score(y, (p >= 0.5).astype(int)),
+            "n_total": len(y),
         })
-    ).sort_values("brier_mean")
-    return summary
+    return pd.DataFrame(rows).set_index("model").sort_values("brier_mean")
 
 
-def diebold_mariano_like(feat: pd.DataFrame, p_a: np.ndarray, p_b: np.ndarray, y: np.ndarray) -> dict:
+def backtest_by_horizon(oos: pd.DataFrame, bucket_edges=(0, 3, 6, 9, 12, 15, 18, 24)) -> pd.DataFrame:
     """
-    Test apparié simple sur la différence de perte quadratique (Brier)
-    entre deux modèles, pour juger si un écart de Brier score est
-    statistiquement significatif ou juste du bruit d'échantillonnage.
-    Pas un vrai DM-test HAC (les cycles se chevauchent peu ici vu le
-    sous-échantillonnage horaire), mais donne un ordre de grandeur.
+    Brier/accuracy par tranche de temps-restant. Essentiel : le Brier
+    pooled est dominé par les échantillons proches de la clôture, où la
+    prédiction devient quasi triviale (d diverge quand tau -> 0). Ce qui
+    compte pour le market making, c'est la qualité tôt dans la fenêtre.
     """
-    d = (p_a - y) ** 2 - (p_b - y) ** 2
-    mean_d = d.mean()
-    se_d = d.std(ddof=1) / math.sqrt(len(d))
+    oos = oos.copy()
+    oos["tau_bucket"] = pd.cut(oos["tau_hours"], bins=bucket_edges)
+    rows = []
+    for bucket, g in oos.groupby("tau_bucket", observed=True):
+        if g.empty:
+            continue
+        y = g["label"].values
+        for col in PRED_COLS:
+            p = np.clip(g[col].values, 1e-4, 1 - 1e-4)
+            rows.append({
+                "tau_bucket": str(bucket),
+                "model": col.replace("p_", ""),
+                "brier": brier_score_loss(y, p),
+                "accuracy": accuracy_score(y, (p >= 0.5).astype(int)),
+                "n": len(y),
+            })
+    return pd.DataFrame(rows).pivot(index="tau_bucket", columns="model", values="brier")
+
+
+def calibration_table(oos: pd.DataFrame, model_col: str = "p_gbm_analytique", n_bins: int = 10) -> pd.DataFrame:
+    """
+    Proba prédite (par décile) vs fréquence réalisée. Un modèle bien
+    calibré doit avoir realized_freq ≈ mean_predicted dans chaque bin —
+    c'est ce qui compte pour fixer un bid/ask, pas juste l'accuracy.
+    """
+    oos = oos.copy()
+    oos["bin"] = pd.qcut(oos[model_col], n_bins, duplicates="drop")
+    tbl = oos.groupby("bin", observed=True).agg(
+        mean_predicted=(model_col, "mean"),
+        realized_freq=("label", "mean"),
+        n=("label", "size"),
+    )
+    return tbl
+
+
+def cluster_significance_test(oos: pd.DataFrame, model_col: str, baseline_col: str) -> dict:
+    """
+    Test apparié sur la différence de perte quadratique, CLUSTERISÉ par
+    cycle_id : on moyenne d'abord la différence de perte au sein de
+    chaque cycle (les ~20 lignes d'un même cycle ne comptent que pour un
+    point), puis t-test sur ces moyennes par cycle. Contrairement à un
+    test ligne-par-ligne, ceci ne pseudo-réplique pas les observations
+    corrélées intra-cycle et ne gonfle donc pas artificiellement la
+    significativité.
+    """
+    y = oos["label"].values
+    d = (oos[model_col].values - y) ** 2 - (oos[baseline_col].values - y) ** 2
+    per_cycle = pd.Series(d, index=oos["cycle_id"].values).groupby(level=0).mean()
+    mean_d = per_cycle.mean()
+    se_d = per_cycle.std(ddof=1) / math.sqrt(len(per_cycle))
     t_stat = mean_d / se_d if se_d > 0 else np.nan
-    return {"mean_diff": mean_d, "t_stat": t_stat, "n": len(d)}
+    return {
+        "mean_diff_brier": mean_d,  # négatif = model_col meilleur que baseline_col
+        "t_stat": t_stat,
+        "n_cycles": len(per_cycle),
+        "significant_5pct": bool(abs(t_stat) > 1.96) if not np.isnan(t_stat) else None,
+    }
 
 
 # ============================================================
@@ -489,20 +540,34 @@ def main():
     feat = build_feature_rows(df_ind, cycles)
 
     print("\n=== Backtest walk-forward (expanding window, 8 folds) ===")
-    summary = run_backtest(feat, n_folds=8)
-    print(summary.to_string())
+    oos = collect_oos_predictions(feat, n_folds=8)
+    print(summarize_predictions(oos).to_string())
 
-    print("\n💡 Lecture :")
-    print(" - brier_mean / logloss_mean : plus bas = mieux.")
-    print(" - Compare gbc_ml / logit_ml au gbm_analytique, PAS au naive_50.")
-    print(" - Si gbm_analytique bat déjà largement naive_50 et prior_hist,")
-    print("   c'est normal (le marché a une dérive/vol structurelle) — la")
-    print("   vraie question est : le ML apporte-t-il un edge AU-DESSUS du GBM ?")
-    print(" - Si l'écart logit_ml/gbc_ml vs gbm_analytique est < ~0.002 en Brier,")
-    print("   ce n'est probablement que du bruit → ne pas déployer le ML seul,")
-    print("   utiliser gbm_analytique (ou un blend à faible poids ML).")
+    print("\n=== Ventilation par temps restant avant clôture (Brier) ===")
+    print(backtest_by_horizon(oos).to_string())
+    print("💡 Si gbm_analytique reste proche de logit_ml/gbc_ml même sur les")
+    print("   tranches tau élevées (>12h, la partie difficile et la plus")
+    print("   utile pour le market making), c'est un signe fort de fiabilité")
+    print("   du baseline analytique — et donc de l'inutilité du ML.")
+
+    print("\n=== Calibration du baseline analytique (déciles) ===")
+    print(calibration_table(oos, "p_gbm_analytique").to_string())
+    print("💡 mean_predicted doit être proche de realized_freq dans chaque bin.")
+
+    print("\n=== Significativité logit_ml vs gbm_analytique (clusterisé par cycle) ===")
+    test_result = cluster_significance_test(oos, "p_logit_ml", "p_gbm_analytique")
+    print(test_result)
+    if test_result["significant_5pct"]:
+        print("→ Écart statistiquement significatif au seuil 5%.")
+    else:
+        print("→ PAS significatif : l'écart observé est probablement du bruit "
+              "d'échantillonnage, pas un vrai edge du ML.")
 
     # Entraînement final sur tout l'historique pour la mise en prod
+    # (à ne déployer que si le test ci-dessus est significatif ET stable
+    #  dans le temps — sinon, utiliser directement analytic_prob_up()
+    #  sans modèle du tout : plus simple, plus robuste, zéro risque
+    #  d'overfitting, et ça ne demande aucun réentraînement périodique).
     model, scaler = train_final_model(feat)
 
 
